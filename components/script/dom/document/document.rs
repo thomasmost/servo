@@ -95,7 +95,6 @@ use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
 use crate::dom::bindings::callback::{ExceptionHandling, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::AnimationFrameProviderBinding::FrameRequestCallback;
-use crate::dom::bindings::codegen::Bindings::AnimationTimelineBinding::AnimationTimelineMethods;
 use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnloadEvent_Binding::BeforeUnloadEventMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, DocumentVisibilityState, ElementCreationOptions,
@@ -5027,15 +5026,9 @@ impl Document {
         self.animation_manager
             .update_for_new_timeline_value(&self.window, current_timeline_value);
 
-        // Script animations: pending play and pause tasks become ready at
-        // this timeline value, and finished states update (step 1 as well).
-        let timeline_time = self
-            .timeline
-            .upcast::<AnimationTimeline>()
-            .GetCurrentTime()
-            .map(|time| *time);
-        self.animation_manager
-            .update_script_animations(cx, &self.window, timeline_time);
+        // Script animations: their pending play and pause tasks run and their
+        // finished states update (step 1 as well).
+        self.animation_manager.update_script_animations(cx, self);
 
         self.maybe_mark_animating_nodes_as_dirty(cx.no_gc());
 

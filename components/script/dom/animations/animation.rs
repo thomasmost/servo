@@ -245,9 +245,13 @@ impl Animation {
         AnimationPlayState::Running
     }
 
-    /// Whether the manager must keep ticking for this animation.
+    /// Whether the manager must keep ticking for this animation. Without an
+    /// active timeline neither a pending task nor the current time can make
+    /// progress, so there is nothing to tick.
     pub(crate) fn needs_ticks(&self) -> bool {
-        self.pending_task.get().is_some() || self.play_state() == AnimationPlayState::Running
+        self.timeline_time().is_some() &&
+            (self.pending_task.get().is_some() ||
+                self.play_state() == AnimationPlayState::Running)
     }
 
     /// Whether the effect is in effect or current, which is what keeps a
@@ -873,17 +877,18 @@ impl Animation {
         event.upcast::<Event>().fire(cx, self.upcast());
     }
 
-    /// Advances this animation for a new timeline value: runs the pending
-    /// play or pause task (the timeline value is the ready time) and
-    /// updates the finished state. Returns false once the manager may
-    /// forget the animation: it is idle, or finished without being
-    /// relevant any more.
-    pub(crate) fn update_for_timeline_tick(
-        &self,
-        cx: &mut JSContext,
-        timeline_time: Option<f64>,
-    ) -> bool {
-        if let (Some(ready_time), Some(task)) = (timeline_time, self.pending_task.get()) {
+    /// Advances this animation on a tick of `document`'s timeline: runs the
+    /// pending play or pause task, with the animation's own timeline time as
+    /// the ready time, and updates the finished state. Returns false once
+    /// the manager of `document` may forget the animation: it uses another
+    /// timeline, it has nothing to tick, or it is finished and not relevant.
+    pub(crate) fn update_for_timeline_tick(&self, cx: &mut JSContext, document: &Document) -> bool {
+        if self.document_for_timing().as_deref() != Some(document) {
+            return false;
+        }
+        // Pending tasks run only with an active timeline, and then at its
+        // current time: "play an animation" is not run without one.
+        if let (Some(ready_time), Some(task)) = (self.timeline_time(), self.pending_task.get()) {
             self.pending_task.set(None);
             match task {
                 PendingTask::Play => self.run_pending_play_task(cx, ready_time),
@@ -894,7 +899,7 @@ impl Animation {
         match self.play_state() {
             AnimationPlayState::Idle => false,
             AnimationPlayState::Finished => self.is_relevant(),
-            _ => true,
+            _ => self.needs_ticks(),
         }
     }
 }
