@@ -43,6 +43,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::NoTrace;
+use crate::dom::document::Document;
 use crate::dom::event::Event;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
 use crate::dom::transitionevent::TransitionEvent;
@@ -395,14 +396,11 @@ impl AnimationManager {
     }
 
     /// Step 1 of "update animations and send events" for script
-    /// animations: runs pending play and pause tasks with `timeline_time`
-    /// (milliseconds) as the ready time and updates finished states.
-    pub(crate) fn update_script_animations(
-        &self,
-        cx: &mut JSContext,
-        window: &Window,
-        timeline_time: Option<f64>,
-    ) {
+    /// animations: ticks each animation of `document`'s timeline (running
+    /// its pending play and pause tasks and updating finished states) and
+    /// updates the running animations presence.
+    pub(crate) fn update_script_animations(&self, cx: &mut JSContext, document: &Document) {
+        let window = document.window();
         let animations: Vec<DomRoot<WebAnimation>> = self
             .script_animations
             .borrow()
@@ -411,7 +409,7 @@ impl AnimationManager {
             .collect();
         let mut done = Vec::new();
         for animation in &animations {
-            if !animation.update_for_timeline_tick(cx, timeline_time) {
+            if !animation.update_for_timeline_tick(cx, document) {
                 done.push(DomRoot::clone(animation));
             }
         }
@@ -800,6 +798,8 @@ impl AnimationManager {
 
         // Steps 6 and 7 of "update animations and send events": a stable
         // sort by scheduled event time, unresolved first, then dispatch.
+        // Known simplification: the spec sorts one queue, while CSS and
+        // script events are sorted and dispatched as two (merging is deferred).
         // (Composite order only matters between events with equal times,
         // which queue order already provides for script animations.)
         script_events.sort_by(|a, b| match (a.scheduled_time, b.scheduled_time) {
