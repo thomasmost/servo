@@ -798,6 +798,8 @@ impl AnimationManager {
 
         // Steps 6 and 7 of "update animations and send events": a stable
         // sort by scheduled event time, unresolved first, then dispatch.
+        // Known simplification: the spec sorts one queue, while CSS and
+        // script events are sorted and dispatched as two (merging is deferred).
         // (Composite order only matters between events with equal times,
         // which queue order already provides for script animations.)
         script_events.sort_by(|a, b| match (a.scheduled_time, b.scheduled_time) {

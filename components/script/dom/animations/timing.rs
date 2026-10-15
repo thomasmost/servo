@@ -144,10 +144,10 @@ fn simple_iteration_progress(
     } else {
         overall_progress % 1.0
     };
-    if progress == 0.0
-        && matches!(phase, Phase::Active | Phase::After)
-        && active_time == active_duration(timing)
-        && timing.iteration_count != 0.0
+    if progress == 0.0 &&
+        matches!(phase, Phase::Active | Phase::After) &&
+        active_time == active_duration(timing) &&
+        timing.iteration_count != 0.0
     {
         return 1.0;
     }
