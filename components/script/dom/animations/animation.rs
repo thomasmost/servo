@@ -159,7 +159,7 @@ impl Animation {
     }
 
     /// Position in the global animation list; `getAnimations()` sorts by it.
-    #[allow(dead_code)] // Used from Phase 6 on; remove the attribute then.
+    #[expect(dead_code, reason = "used by getAnimations()")]
     pub(crate) fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
