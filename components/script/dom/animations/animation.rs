@@ -159,7 +159,7 @@ impl Animation {
     }
 
     /// Position in the global animation list; `getAnimations()` sorts by it.
-    #[expect(dead_code, reason = "used by getAnimations()")]
+    #[expect(dead_code, reason = "read by getAnimations(), which is not implemented yet")]
     pub(crate) fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
