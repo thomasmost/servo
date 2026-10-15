@@ -7,3 +7,4 @@ pub(crate) mod animationeffect;
 pub(crate) mod animationtimeline;
 pub(crate) mod documenttimeline;
 pub(crate) mod keyframeeffect;
+pub(crate) mod timing;
