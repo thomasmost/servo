@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+use std::ops::{Deref, RangeInclusive};
+
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
+use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
+use style::computed_values::font_variant_caps::T as FontVariantCaps;
+use style::font_face::{
+    ComputedFontStyleRange, ComputedFontWeightRange, ComputedFontWidthRange, Descriptors,
+    FontStyleRange, FontWeightRange, FontWidthRange,
+};
+use style::properties::style_structs::Font as FontStyleStruct;
+use style::stylesheets::FontFaceRule;
+use style::values::computed::{Au, FontStyle, FontSynthesis, FontWeight, FontWidth};
+use webrender_api::FontVariation;
+
+/// `FontDescriptor` describes the parameters of a `Font`. It represents rendering a given font
+/// template at a particular size, with a particular font-variant-caps applied, etc. This contrasts
+/// with `FontTemplateDescriptor` in that the latter represents only the parameters inherent in the
+/// font data (weight, stretch, etc.).
+#[derive(Clone, Debug, Deserialize, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct FontDescriptor {
+    pub weight: FontWeight,
+    pub width: FontWidth,
+    pub style: FontStyle,
+    pub variant: FontVariantCaps,
+    pub pt_size: Au,
+    /// The value of the `@font-variation-settings` property.
+    ///
+    /// This does not include synthesized variations from `font-style`, `font-stretch` etc.
+    pub variation_settings: Vec<FontVariation>,
+    pub synthesis_weight: FontSynthesis,
+    pub optical_sizing: FontOpticalSizing,
+}
+
+impl Eq for FontDescriptor {}
+
+impl<'a> From<&'a FontStyleStruct> for FontDescriptor {
+    fn from(style: &'a FontStyleStruct) -> Self {
+        let variation_settings = style
+            .clone_font_variation_settings()
+            .0
+            .into_iter()
+            .map(|setting| FontVariation {
+                tag: setting.tag.0,
+                value: setting.value,
+            })
+            .collect();
+        FontDescriptor {
+            weight: style.font_weight,
+            width: style.font_width,
+            style: style.font_style,
+            variant: style.font_variant_caps,
+            pt_size: Au::from_f32_px(style.font_size.computed_size().px()),
+            variation_settings,
+            synthesis_weight: style.clone_font_synthesis_weight(),
+            optical_sizing: style.clone_font_optical_sizing(),
+        }
+    }
+}
+
+/// This data structure represents the various optional descriptors that can be
+/// applied to a `@font-face` rule in CSS. These are used to create a [`FontTemplate`]
+/// from the given font data used as the source of the `@font-face` rule. If values
+/// like weight, stretch, and style are not specified they are initialized based
+/// on the contents of the font itself.
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, Serialize)]
+pub struct CSSFontFaceDescriptors {
+    pub family_name: LowercaseFontFamilyName,
+    pub weight: Option<ComputedFontWeightRange>,
+    pub width: Option<ComputedFontWidthRange>,
+    pub style: Option<ComputedFontStyleRange>,
+    pub unicode_range: Option<Vec<RangeInclusive<u32>>>,
+}
+
+impl CSSFontFaceDescriptors {
+    pub fn new(family_name: &str) -> Self {
+        CSSFontFaceDescriptors {
+            family_name: family_name.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&Descriptors> for CSSFontFaceDescriptors {
+    fn from(descriptors: &Descriptors) -> Self {
+        let family_name = descriptors
+            .font_family
+            .as_ref()
+            .expect("Expected rule to contain a font family.")
+            .name
+            .clone();
+        let weight = descriptors
+            .font_weight
+            .as_ref()
+            .and_then(FontWeightRange::compute);
+        let width = descriptors
+            .font_width
+            .as_ref()
+            .and_then(FontWidthRange::compute);
+        let style = descriptors
+            .font_style
+            .as_ref()
+            .and_then(FontStyleRange::compute);
+        let unicode_range = descriptors
+            .unicode_range
+            .as_ref()
+            .map(|ranges| ranges.iter().map(|range| range.start..=range.end).collect());
+
+        CSSFontFaceDescriptors {
+            family_name: family_name.into(),
+            weight,
+            width,
+            style,
+            unicode_range,
+        }
+    }
+}
+
+impl From<&FontFaceRule> for CSSFontFaceDescriptors {
+    fn from(rule: &FontFaceRule) -> Self {
+        (&rule.descriptors).into()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct LowercaseFontFamilyName {
+    inner: String,
+}
+
+impl<T: AsRef<str>> From<T> for LowercaseFontFamilyName {
+    fn from(value: T) -> Self {
+        LowercaseFontFamilyName {
+            inner: value.as_ref().to_lowercase(),
+        }
+    }
+}
+
+impl Deref for LowercaseFontFamilyName {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl std::fmt::Display for LowercaseFontFamilyName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
