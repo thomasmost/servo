@@ -31,7 +31,7 @@ use crate::dom::bindings::codegen::Bindings::AnimationPlaybackEventBinding::Anim
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, MutNullableDom};
-use crate::dom::document::Document;
+use crate::dom::document::{Document, RenderingUpdateReason};
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -825,13 +825,18 @@ impl Animation {
         scheduled_time: Option<f64>,
     ) {
         match self.document_for_timing() {
-            Some(document) => document.animation_manager().queue_script_animation_event(
-                self,
-                event_type,
-                current_time,
-                timeline_time,
-                scheduled_time,
-            ),
+            Some(document) => {
+                document.animation_manager().queue_script_animation_event(
+                    self,
+                    event_type,
+                    current_time,
+                    timeline_time,
+                    scheduled_time,
+                );
+                document.add_rendering_update_reason(
+                    RenderingUpdateReason::AnimationPlaybackEventQueued,
+                );
+            },
             None => {
                 let animation = Trusted::new(self);
                 self.global()

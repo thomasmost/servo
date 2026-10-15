@@ -372,6 +372,11 @@ bitflags! {
         /// one more rendering update possibility after this happens, so that any potential screenshot
         /// reflects the up-to-date contents.
         const FontReadyPromiseFulfilled = 1 << 2;
+        /// An animation queued a `finish` or `cancel` event. Nothing else
+        /// schedules a rendering update when no animation is running, and the
+        /// event is only dispatched by "update animations and send events", so
+        /// this asks for one.
+        const AnimationPlaybackEventQueued = 1 << 3;
     }
 }
 
