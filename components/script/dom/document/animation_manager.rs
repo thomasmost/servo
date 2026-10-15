@@ -7,12 +7,13 @@
 #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cssparser::ToCss;
 use embedder_traits::{AnimationState as AnimationsPresentState, UntrustedNodeAddress};
-use js::context::NoGC;
+use js::context::{JSContext, NoGC};
 use layout_api::AnimatingImages;
 use libc::c_void;
 use paint_api::ImageUpdate;
@@ -32,6 +33,7 @@ use style::dom::OpaqueNode;
 use style::selector_parser::PseudoElement;
 use timers::TimerId;
 
+use crate::dom::animation::{Animation as WebAnimation, PlaybackEventType};
 use crate::dom::animationevent::AnimationEvent;
 use crate::dom::bindings::codegen::Bindings::AnimationEventBinding::AnimationEventInit;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
@@ -74,6 +76,17 @@ pub(crate) struct AnimationManager {
     /// A list of pending animation-related events.
     pending_events: DomRefCell<Vec<TransitionOrAnimationEvent>>,
 
+    /// Script-created animations that have left the idle play state. They
+    /// are ticked every frame and dropped once idle, or finished and no
+    /// longer relevant.
+    script_animations: DomRefCell<Vec<Dom<WebAnimation>>>,
+
+    /// Finish and cancel events waiting for the next "update animations
+    /// and send events".
+    ///
+    /// <https://drafts.csswg.org/web-animations-1/#pending-animation-event-queue>
+    pending_script_events: DomRefCell<Vec<ScriptAnimationEvent>>,
+
     /// The timeline value at the last time all animations were marked dirty.
     /// This is used to prevent marking animations dirty when the timeline
     /// has not changed.
@@ -93,6 +106,8 @@ impl AnimationManager {
             rooted_animation_nodes: Default::default(),
             rooted_image_nodes: Default::default(),
             pending_events: Default::default(),
+            script_animations: Default::default(),
+            pending_script_events: Default::default(),
             timeline_value_at_last_dirty: Cell::new(0.0),
             image_callback_timer_id: Default::default(),
         }
@@ -112,6 +127,8 @@ impl AnimationManager {
         self.rooted_animation_nodes.borrow_mut().clear();
         self.rooted_image_nodes.borrow_mut().clear();
         self.pending_events.borrow_mut().clear();
+        self.script_animations.borrow_mut().clear();
+        self.pending_script_events.borrow_mut().clear();
     }
 
     // Mark all animations dirty, if they haven't been marked dirty since the
@@ -222,7 +239,8 @@ impl AnimationManager {
         // up space as soon as we are no longer tracking any animations for
         // a node.
         sets.retain(|_, state| !state.is_empty());
-        let have_running_animations = sets.values().any(|state| state.needs_animation_ticks());
+        let have_running_animations = sets.values().any(|state| state.needs_animation_ticks()) ||
+            self.has_running_script_animations();
 
         self.update_running_animations_presence(window, have_running_animations);
 
@@ -333,7 +351,8 @@ impl AnimationManager {
 
     fn handle_animation_presence_or_pending_events_change(&self, window: &Window) {
         let has_running_animations = self.has_running_animations.get();
-        let has_pending_events = !self.pending_events.borrow().is_empty();
+        let has_pending_events = !self.pending_events.borrow().is_empty() ||
+            !self.pending_script_events.borrow().is_empty();
 
         // Do not send the AnimationCallbacksAbsent state until all pending
         // animation events are delivered.
@@ -346,13 +365,94 @@ impl AnimationManager {
         ));
     }
 
+    /// Starts ticking a script animation. Idempotent.
+    pub(crate) fn register_script_animation(&self, animation: &WebAnimation) {
+        let mut animations = self.script_animations.borrow_mut();
+        if !animations.iter().any(|existing| **existing == *animation) {
+            animations.push(Dom::from_ref(animation));
+        }
+    }
+
+    /// Appends to the pending animation event queue; dispatched by
+    /// `send_pending_events`.
+    pub(crate) fn queue_script_animation_event(
+        &self,
+        animation: &WebAnimation,
+        event_type: PlaybackEventType,
+        current_time: Option<f64>,
+        timeline_time: Option<f64>,
+        scheduled_time: Option<f64>,
+    ) {
+        self.pending_script_events
+            .borrow_mut()
+            .push(ScriptAnimationEvent {
+                animation: Dom::from_ref(animation),
+                event_type,
+                current_time,
+                timeline_time,
+                scheduled_time,
+            });
+    }
+
+    /// Step 1 of "update animations and send events" for script
+    /// animations: runs pending play and pause tasks with `timeline_time`
+    /// (milliseconds) as the ready time and updates finished states.
+    pub(crate) fn update_script_animations(
+        &self,
+        cx: &mut JSContext,
+        window: &Window,
+        timeline_time: Option<f64>,
+    ) {
+        let animations: Vec<DomRoot<WebAnimation>> = self
+            .script_animations
+            .borrow()
+            .iter()
+            .map(|animation| DomRoot::from_ref(&**animation))
+            .collect();
+        let mut done = Vec::new();
+        for animation in &animations {
+            if !animation.update_for_timeline_tick(cx, timeline_time) {
+                done.push(DomRoot::clone(animation));
+            }
+        }
+        self.script_animations
+            .borrow_mut()
+            .retain(|animation| !done.iter().any(|finished| **finished == **animation));
+
+        let running_css_animations = self
+            .sets
+            .sets
+            .read()
+            .values()
+            .any(|set| set.needs_animation_ticks());
+        self.update_running_animations_presence(
+            window,
+            running_css_animations || self.has_running_script_animations(),
+        );
+    }
+
+    fn has_running_script_animations(&self) -> bool {
+        self.script_animations
+            .borrow()
+            .iter()
+            .any(|animation| animation.needs_ticks())
+    }
+
     pub(crate) fn running_animation_count(&self) -> usize {
-        self.sets
+        let css = self
+            .sets
             .sets
             .read()
             .values()
             .map(|state| state.running_animation_and_transition_count())
-            .sum()
+            .sum::<usize>();
+        let script = self
+            .script_animations
+            .borrow()
+            .iter()
+            .filter(|animation| animation.needs_ticks())
+            .count();
+        css + script
     }
 
     /// Walk through the list of pending animations and start all of the ones that
@@ -617,7 +717,8 @@ impl AnimationManager {
         // Take all of the events here, in case sending one of these events
         // triggers adding new events by forcing a layout.
         let events = std::mem::take(&mut *self.pending_events.safe_borrow_mut(cx.no_gc()));
-        if events.is_empty() {
+        let mut script_events = std::mem::take(&mut *self.pending_script_events.borrow_mut());
+        if events.is_empty() && script_events.is_empty() {
             return;
         }
 
@@ -697,7 +798,29 @@ impl AnimationManager {
             }
         }
 
-        if self.pending_events.borrow().is_empty() {
+        // Steps 6 and 7 of "update animations and send events": a stable
+        // sort by scheduled event time, unresolved first, then dispatch.
+        // (Composite order only matters between events with equal times,
+        // which queue order already provides for script animations.)
+        script_events.sort_by(|a, b| match (a.scheduled_time, b.scheduled_time) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+        });
+        for event in script_events {
+            let animation = DomRoot::from_ref(&*event.animation);
+            animation.dispatch_playback_event(
+                cx,
+                event.event_type,
+                event.current_time,
+                event.timeline_time,
+            );
+        }
+
+        if self.pending_events.borrow().is_empty() &&
+            self.pending_script_events.borrow().is_empty()
+        {
             self.handle_animation_presence_or_pending_events_change(window);
         }
     }
@@ -781,4 +904,17 @@ fn root_node(
         let address = UntrustedNodeAddress(opaque_node.0 as *const c_void);
         unsafe { Dom::from_ref(&*from_untrusted_node_address(address)) }
     });
+}
+
+/// A `finish` or `cancel` event for a script animation, with the values
+/// captured when it was queued.
+#[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct ScriptAnimationEvent {
+    animation: Dom<WebAnimation>,
+    event_type: PlaybackEventType,
+    current_time: Option<f64>,
+    timeline_time: Option<f64>,
+    /// <https://drafts.csswg.org/web-animations-1/#scheduled-event-time>
+    scheduled_time: Option<f64>,
 }
