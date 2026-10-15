@@ -4,6 +4,8 @@
 
 pub(crate) mod animation;
 pub(crate) mod animationeffect;
+pub(crate) mod animationplaybackevent;
 pub(crate) mod animationtimeline;
 pub(crate) mod documenttimeline;
 pub(crate) mod keyframeeffect;
+pub(crate) mod timing;

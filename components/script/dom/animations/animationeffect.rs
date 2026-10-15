@@ -4,6 +4,7 @@
 
 use cssparser::Parser;
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::AnimationEffectBinding::{
     AnimationEffectMethods, ComputedEffectTiming, EffectTiming, FillMode, OptionalEffectTiming,
@@ -23,7 +24,10 @@ use style_traits::{ParsingMode, ToCss};
 
 use crate::css::css::parser_context_for_document;
 use crate::dom::Window;
+use crate::dom::animation::Animation;
+use crate::dom::animations::timing::{self, Timing};
 use crate::dom::bindings::codegen::UnionTypes::UnrestrictedDoubleOrString;
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 
 /// <https://drafts.csswg.org/web-animations-1/#animationeffect>
 #[dom_struct]
@@ -34,6 +38,11 @@ pub(crate) struct AnimationEffect {
     window: Dom<Window>,
 
     specified_timing_properties: DomRefCell<SpecifiedTimingProperties>,
+
+    /// The animation this effect is associated with, if any.
+    ///
+    /// <https://drafts.csswg.org/web-animations-1/#animation-associated-effect>
+    animation: MutNullableDom<Animation>,
 }
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -70,19 +79,19 @@ impl AnimationEffect {
             reflector: Reflector::new(),
             window: Dom::from_ref(window),
 
-            // The default values of the timing properties specified here don't matter.
-            // There is no way to construct a AnimationEffect without subsequently initializing them,
-            // even if they're not passed to the constructor.
+            // The defaults of the EffectTiming dictionary: members that the
+            // constructor's options do not mention keep these.
             specified_timing_properties: DomRefCell::new(SpecifiedTimingProperties {
-                start_delay: Default::default(),
-                end_delay: Default::default(),
-                fill_mode: FillMode::None,
-                iteration_count: Default::default(),
-                iteration_start: Default::default(),
+                start_delay: Finite::wrap(0.0),
+                end_delay: Finite::wrap(0.0),
+                fill_mode: FillMode::Auto,
+                iteration_count: 1.0,
+                iteration_start: Finite::wrap(0.0),
                 iteration_duration: IterationDurationOrAuto::Auto,
                 playback_direction: PlaybackDirection::Normal,
                 easing_function: TimingFunction::Keyword(TimingKeyword::Linear),
             }),
+            animation: Default::default(),
         }
     }
 
@@ -90,9 +99,53 @@ impl AnimationEffect {
         &self.window
     }
 
+    pub(crate) fn animation(&self) -> Option<DomRoot<Animation>> {
+        self.animation.get()
+    }
+
+    /// Called by `Animation::set_the_associated_effect`; keeps the back
+    /// pointer that local time and finished-state updates need.
+    pub(crate) fn set_animation(&self, animation: Option<&Animation>) {
+        self.animation.set(animation);
+    }
+
+    /// The timing properties with `auto` resolved, as the timing model
+    /// consumes them.
+    pub(crate) fn timing(&self) -> Timing {
+        let properties = self.specified_timing_properties.borrow();
+        Timing {
+            start_delay: *properties.start_delay,
+            end_delay: *properties.end_delay,
+            fill: match properties.fill_mode {
+                FillMode::None | FillMode::Auto => timing::Fill::None,
+                FillMode::Forwards => timing::Fill::Forwards,
+                FillMode::Backwards => timing::Fill::Backwards,
+                FillMode::Both => timing::Fill::Both,
+            },
+            iteration_start: *properties.iteration_start,
+            iteration_count: properties.iteration_count,
+            iteration_duration: properties.iteration_duration.computed_value(),
+            direction: match properties.playback_direction {
+                PlaybackDirection::Normal => timing::Direction::Normal,
+                PlaybackDirection::Reverse => timing::Direction::Reverse,
+                PlaybackDirection::Alternate => timing::Direction::Alternate,
+                PlaybackDirection::Alternate_reverse => timing::Direction::AlternateReverse,
+            },
+            easing: properties
+                .easing_function
+                .to_computed_value_without_context(),
+        }
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#end-time>
+    pub(crate) fn end_time(&self) -> f64 {
+        timing::end_time(&self.timing())
+    }
+
     /// <https://drafts.csswg.org/web-animations-1/#update-the-timing-properties-of-an-animation-effect>
     pub(crate) fn update_the_timing_properties(
         &self,
+        cx: &mut JSContext,
         input: &OptionalEffectTiming,
     ) -> Fallible<()> {
         // Step 1. If the iterationStart member of input exists and is less than zero,
@@ -213,6 +266,13 @@ impl AnimationEffect {
         if let Some(easing) = easing {
             specified_timing_properties.easing_function = easing;
         }
+        drop(specified_timing_properties);
+
+        // Step 6. If effect is associated with an animation, run the
+        // procedure to update an animation's finished state.
+        if let Some(animation) = self.animation.get() {
+            animation.update_finished_state(cx, false, false);
+        }
         Ok(())
     }
 }
@@ -241,6 +301,12 @@ impl AnimationEffectMethods<crate::DomTypeHolder> for AnimationEffect {
     fn GetComputedTiming(&self) -> ComputedEffectTiming {
         // > Returns the calculated timing properties for this animation effect.
         let specified_timing_properties = self.specified_timing_properties.borrow();
+
+        let (local_time, playback_rate) = match self.animation.get() {
+            Some(animation) => (animation.current_time(), animation.playback_rate()),
+            None => (None, 1.0),
+        };
+        let computed = timing::compute(&self.timing(), local_time, playback_rate);
 
         // > while getTiming() can return the string auto, getComputedTiming() must return a number
         // > corresponding to the calculated value of the iteration duration as defined in the description
@@ -274,20 +340,56 @@ impl AnimationEffectMethods<crate::DomTypeHolder> for AnimationEffect {
                 iterationStart: specified_timing_properties.iteration_start,
                 iterations: specified_timing_properties.iteration_count,
             },
-            // FIXME: These are just placeholder values
-            endTime: None,
-            activeDuration: None,
-            localTime: None,
-            progress: None,
-            currentIteration: None,
+            endTime: Some(computed.end_time),
+            activeDuration: Some(computed.active_duration),
+            localTime: Some(computed.local_time.and_then(Finite::new)),
+            progress: Some(computed.progress.and_then(Finite::new)),
+            currentIteration: Some(computed.current_iteration),
         }
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#dom-animationeffect-updatetiming>
-    fn UpdateTiming(&self, timing: &OptionalEffectTiming) -> Fallible<()> {
+    fn UpdateTiming(&self, cx: &mut JSContext, timing: &OptionalEffectTiming) -> Fallible<()> {
         // > Updates the specified timing properties of this animation effect by performing the procedure
         // > to update the timing properties of an animation effect passing the timing parameter as input.
-        self.update_the_timing_properties(timing)
+        self.update_the_timing_properties(cx, timing)
+    }
+}
+
+/// Every member of `timing` as an `OptionalEffectTiming`: the "timing
+/// input" of the KeyframeEffect constructor for a dictionary argument.
+pub(crate) fn optional_effect_timing(timing: &EffectTiming) -> OptionalEffectTiming {
+    OptionalEffectTiming {
+        delay: Some(timing.delay),
+        direction: Some(timing.direction),
+        duration: Some(match &timing.duration {
+            UnrestrictedDoubleOrString::UnrestrictedDouble(duration) => {
+                UnrestrictedDoubleOrString::UnrestrictedDouble(*duration)
+            },
+            UnrestrictedDoubleOrString::String(duration) => {
+                UnrestrictedDoubleOrString::String(duration.clone())
+            },
+        }),
+        easing: Some(timing.easing.clone()),
+        endDelay: Some(timing.endDelay),
+        fill: Some(timing.fill),
+        iterationStart: Some(timing.iterationStart),
+        iterations: Some(timing.iterations),
+    }
+}
+
+/// The "timing input" for a bare number argument: a duration, with every
+/// other member left at its default.
+pub(crate) fn optional_effect_timing_for_duration(duration: f64) -> OptionalEffectTiming {
+    OptionalEffectTiming {
+        delay: None,
+        direction: None,
+        duration: Some(UnrestrictedDoubleOrString::UnrestrictedDouble(duration)),
+        easing: None,
+        endDelay: None,
+        fill: None,
+        iterationStart: None,
+        iterations: None,
     }
 }
 

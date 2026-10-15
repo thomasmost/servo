@@ -77,6 +77,10 @@ use crate::css::stylesheet_loader::StylesheetOwner;
 use crate::dom::RootedPromise;
 use crate::dom::activation::Activatable;
 use crate::dom::animation::Animation;
+use crate::dom::animationeffect::AnimationEffect;
+use crate::dom::animations::animationeffect::{
+    optional_effect_timing, optional_effect_timing_for_duration,
+};
 use crate::dom::animations::keyframeeffect::KeyframeEffect;
 use crate::dom::attr::{Attr, is_relevant_attribute};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
@@ -4598,35 +4602,38 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         cx: &mut JSContext,
         keyframes: *mut JSObject,
         options: UnrestrictedDoubleOrKeyframeAnimationOptions,
-    ) -> DomRoot<Animation> {
+    ) -> Fallible<DomRoot<Animation>> {
         let window = self.owner_window();
 
         // Step 1. Let target be the object on which this method was called.
         let target = self;
 
-        // Step 3. If options is a KeyframeAnimationOptions object, let timeline be the timeline member of
-        // options or, if timeline member of options is missing, the default document timeline of the node document
-        // of the element on which this method was called.
-        let timeline =
-            if let UnrestrictedDoubleOrKeyframeAnimationOptions::KeyframeAnimationOptions(options) =
-                &options
-            {
-                options.timeline.clone().flatten()
-            } else {
-                None
-            };
+        // Step 3. If options is a KeyframeAnimationOptions object, let timeline
+        // be the timeline member of options or, if the timeline member of
+        // options is missing, be the default document timeline of the node
+        // document of the element on which this method was called. An explicit
+        // null timeline stays null. (Step 5 reads the id from the same object,
+        // and the timing input of the KeyframeEffect constructor comes from it
+        // too.)
+        let (timeline, id, timing_input) = match &options {
+            UnrestrictedDoubleOrKeyframeAnimationOptions::KeyframeAnimationOptions(options) => (
+                options.timeline.clone(),
+                Some(options.id.clone()),
+                optional_effect_timing(&options.parent.parent),
+            ),
+            UnrestrictedDoubleOrKeyframeAnimationOptions::UnrestrictedDouble(duration) => {
+                (None, None, optional_effect_timing_for_duration(*duration))
+            },
+        };
         let timeline = timeline.unwrap_or_else(|| {
             let document = self.owner_document();
-            DomRoot::upcast(document.Timeline())
+            Some(DomRoot::upcast(document.Timeline()))
         });
 
-        // Step 2. Construct a new KeyframeEffect object effect in the relevant Realm
-        // of target by using the same procedure as the KeyframeEffect(target, keyframes, options)
-        // constructor, passing target as the target argument, and the keyframes and options arguments
-        //  as supplied.
-        //
-        // If the above procedure causes an exception to be thrown, propagate the exception and
-        // abort this procedure.
+        // Step 2. Construct a new KeyframeEffect object, effect, in the relevant
+        // Realm of target by using the same procedure as the KeyframeEffect(target,
+        // keyframes, options) constructor, passing target as the target argument,
+        // and the keyframes and options arguments as supplied.
         let parent_options = match options {
             UnrestrictedDoubleOrKeyframeAnimationOptions::UnrestrictedDouble(value) => {
                 UnrestrictedDoubleOrKeyframeEffectOptions::UnrestrictedDouble(value)
@@ -4637,25 +4644,36 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         };
         let effect =
             KeyframeEffect::Constructor(cx, &window, None, Some(target), keyframes, parent_options);
+        // The KeyframeEffect constructor does not apply its options yet (a
+        // later patch moves this into it): apply the timing input here so
+        // the animation has its duration, iterations and fill.
+        effect
+            .upcast::<AnimationEffect>()
+            .update_the_timing_properties(cx, &timing_input)?;
 
-        // Step 4. Construct a new Animation object, animation, in the relevant Realm of target by using
-        // the same procedure as the Animation() constructor, passing effect and timeline as arguments of
-        // the same name.
+        // Step 4. Construct a new Animation object, animation, in the relevant
+        // Realm of target by using the same procedure as the Animation() constructor,
+        // passing effect and timeline as arguments of the same name.
         let animation = Animation::Constructor(
             cx,
             &window,
             None,
             Some(effect.upcast()),
-            Some(Some(&timeline)),
+            Some(timeline.as_deref()),
         );
 
-        // TODO: Step 5. If options is a KeyframeAnimationOptions object, assign the value of the id member of options
-        // to animation’s id attribute.
+        // Step 5. If options is a KeyframeAnimationOptions object, assign the
+        // value of the id member of options to animation's id attribute.
+        if let Some(id) = id {
+            animation.SetId(id);
+        }
 
-        // TODO: Step 6. Run the procedure to play an animation for animation with the auto-rewind flag set to true.
+        // Step 6. Run the procedure to play an animation for animation with
+        // the auto-rewind flag set to true.
+        animation.play_an_animation(cx, true)?;
 
         // Step 7. Return animation.
-        animation
+        Ok(animation)
     }
 }
 
