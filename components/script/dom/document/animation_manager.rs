@@ -445,6 +445,13 @@ impl AnimationManager {
     /// element, so their composite order is their position in the global
     /// animation list, which the sequence number records.
     ///
+    /// This manager lists only the animations registered with it, which are
+    /// those whose timeline belongs to this document. An animation whose
+    /// target is in a different document (a same-origin iframe, or a target
+    /// adopted into another document) is therefore not listed by the
+    /// target's document, and an animation with a null timeline is never
+    /// registered, so it is never listed.
+    ///
     /// <https://drafts.csswg.org/web-animations-1/#relevant>
     pub(crate) fn relevant_script_animations(
         &self,

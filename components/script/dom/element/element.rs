@@ -4604,6 +4604,9 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         self.owner_document()
             .animation_manager()
             .relevant_script_animations(&|target| {
+                // The subtree option is a plain tree check: it does not
+                // cross shadow boundaries, so a shadow-tree descendant is
+                // excluded.
                 if options.subtree {
                     node.is_inclusive_ancestor_of(target.upcast::<Node>())
                 } else {
