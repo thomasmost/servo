@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::default::Default;
-use std::iter;
 
 use crate::dom::activation::Activatable;
 use crate::dom::element::attributes::storage::AttrRef;
@@ -41,7 +40,8 @@ use crate::dom::html::htmlformelement::{FormControl, FormDatum, FormDatumValue, 
 use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
 use crate::dom::html::htmloptionelement::HTMLOptionElement;
 use crate::dom::html::htmloptionscollection::HTMLOptionsCollection;
-use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits,  UnbindContext};
+use crate::dom::node::iterators::UnrootedSimpleNodeIterator;
+use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
 use crate::dom::nodelist::NodeList;
 use crate::dom::text::Text;
 use crate::dom::types::FocusEvent;
@@ -189,21 +189,11 @@ impl HTMLSelectElement {
         &self,
         no_gc: &'b NoGC,
     ) -> impl Iterator<Item = UnrootedDom<'b, HTMLOptionElement>> + use<'b> {
-        self.upcast::<Node>()
-            .children_unrooted(no_gc)
-            .flat_map(|node| {
-                if node.is::<HTMLOptionElement>() {
-                    let node = UnrootedDom::downcast::<HTMLOptionElement>(node).unwrap();
-                    Choice3::First(iter::once(node))
-                } else if node.is::<HTMLOptGroupElement>() {
-                    Choice3::Second(
-                        node.children_unrooted(no_gc)
-                            .filter_map(UnrootedDom::downcast),
-                    )
-                } else {
-                    Choice3::Third(iter::empty())
-                }
-            })
+        OptionListIterator {
+            children: unrooted_children(self.upcast::<Node>(), no_gc),
+            group_children: None,
+            no_gc,
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#placeholder-label-option>
@@ -1001,33 +991,53 @@ impl Activatable for HTMLSelectElement {
     }
 }
 
-enum Choice3<I, J, K> {
-    First(I),
-    Second(J),
-    Third(K),
+/// The children of `node`, unrooted, in tree order.
+type UnrootedChildIterator<'b> =
+    UnrootedSimpleNodeIterator<'b, fn(&Node, &'b NoGC) -> Option<UnrootedDom<'b, Node>>>;
+
+fn unrooted_children<'b>(node: &Node, no_gc: &'b NoGC) -> UnrootedChildIterator<'b> {
+    UnrootedSimpleNodeIterator::new(
+        node.get_first_child_unrooted(no_gc),
+        Node::get_next_sibling_unrooted,
+        no_gc,
+    )
 }
 
-impl<I, J, K, T> Iterator for Choice3<I, J, K>
-where
-    I: Iterator<Item = T>,
-    J: Iterator<Item = T>,
-    K: Iterator<Item = T>,
-{
-    type Item = T;
+/// The list of options of a `<select>` element: its `<option>` children and the
+/// `<option>` children of its `<optgroup>` children, in tree order.
+///
+/// This is a hand-written iterator rather than a `flat_map` over the children.
+/// The `flat_map` form was miscompiled in release builds on Windows x86_64 with
+/// rustc 1.97.1 (without LTO): `HTMLSelectElement::SetValue` received each
+/// option's next sibling in place of the option, which crashed when that
+/// sibling was a text node (servo/servo#48109).
+#[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_interior)]
+struct OptionListIterator<'b> {
+    children: UnrootedChildIterator<'b>,
+    group_children: Option<UnrootedChildIterator<'b>>,
+    no_gc: &'b NoGC,
+}
 
-    fn next(&mut self) -> Option<T> {
-        match *self {
-            Choice3::First(ref mut i) => i.next(),
-            Choice3::Second(ref mut j) => j.next(),
-            Choice3::Third(ref mut k) => k.next(),
-        }
-    }
+impl<'b> Iterator for OptionListIterator<'b> {
+    type Item = UnrootedDom<'b, HTMLOptionElement>;
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match *self {
-            Choice3::First(ref i) => i.size_hint(),
-            Choice3::Second(ref j) => j.size_hint(),
-            Choice3::Third(ref k) => k.size_hint(),
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(group_children) = self.group_children.as_mut() {
+                for child in group_children.by_ref() {
+                    if let Some(option) = UnrootedDom::downcast::<HTMLOptionElement>(child) {
+                        return Some(option);
+                    }
+                }
+                self.group_children = None;
+            }
+
+            let child = self.children.next()?;
+            if child.is::<HTMLOptGroupElement>() {
+                self.group_children = Some(unrooted_children(&child, self.no_gc));
+            } else if let Some(option) = UnrootedDom::downcast::<HTMLOptionElement>(child) {
+                return Some(option);
+            }
         }
     }
 }
