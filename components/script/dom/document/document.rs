@@ -90,6 +90,7 @@ use url::{Host, Position};
 
 use crate::css::stylesheet_loader::StylesheetContextId;
 use crate::css::stylesheet_set::StylesheetSetRef;
+use crate::dom::animation::Animation;
 use crate::dom::animationtimeline::AnimationTimeline;
 use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
@@ -7202,6 +7203,15 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     fn Timeline(&self) -> DomRoot<DocumentTimeline> {
         self.timeline.as_rooted()
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations>
+    fn GetAnimations(&self) -> Vec<DomRoot<Animation>> {
+        let root = self.upcast::<Node>();
+        self.animation_manager
+            .relevant_script_animations(&|target| {
+                root.is_inclusive_ancestor_of(target.upcast::<Node>())
+            })
     }
 }
 

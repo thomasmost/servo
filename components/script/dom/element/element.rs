@@ -79,6 +79,7 @@ use crate::dom::activation::Activatable;
 use crate::dom::animation::Animation;
 use crate::dom::animations::keyframeeffect::KeyframeEffect;
 use crate::dom::attr::{Attr, is_relevant_attribute};
+use crate::dom::bindings::codegen::Bindings::AnimatableBinding::GetAnimationsOptions;
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
@@ -4590,6 +4591,25 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
             return part;
         };
         part
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-animatable-getanimations>
+    fn GetAnimations(&self, options: &GetAnimationsOptions) -> Vec<DomRoot<Animation>> {
+        // Pseudo-element targets are not supported, so no animation can
+        // target one.
+        if options.pseudoElement.is_some() {
+            return Vec::new();
+        }
+        let node = self.upcast::<Node>();
+        self.owner_document()
+            .animation_manager()
+            .relevant_script_animations(&|target| {
+                if options.subtree {
+                    node.is_inclusive_ancestor_of(target.upcast::<Node>())
+                } else {
+                    std::ptr::eq(target, self)
+                }
+            })
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#dom-animatable-animate>

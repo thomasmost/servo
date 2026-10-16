@@ -176,9 +176,16 @@ impl Animation {
     }
 
     /// Position in the global animation list; `getAnimations()` sorts by it.
-    #[expect(dead_code, reason = "read by getAnimations(), which is not implemented yet")]
     pub(crate) fn sequence_number(&self) -> u64 {
         self.sequence_number
+    }
+
+    /// The element targeted by the associated keyframe effect, if any.
+    pub(crate) fn effect_target(&self) -> Option<DomRoot<Element>> {
+        self.associated_effect
+            .get()
+            .and_then(|effect| DomRoot::downcast::<KeyframeEffect>(effect))
+            .and_then(|effect| effect.target())
     }
 
     pub(crate) fn playback_rate(&self) -> f64 {
@@ -241,11 +248,17 @@ impl Animation {
         self.sampled_target.set(Some(&*target));
         self.sampled_generation.set(generation);
         self.sampled_progress.set(progress);
-        // A target that is not rendered is not restyled for the sampled value:
-        // nothing shows it. Layout cancels a stylo set only for a rooted node
-        // (one with CSS animations or transitions) that stopped rendering, so
-        // a script-only target keeps its entry and only its progress is set.
-        // A cancelled entry is pushed again by the branch above on this tick.
+        // A target that is not rendered is not restyled for the sampled value.
+        // Layout cancels a stylo set only for a rooted node (one that had CSS
+        // animations or transitions while its set existed, and stays rooted
+        // while the set is non-empty or an event for it is pending) that has
+        // stopped rendering. A script-only target is never rooted, so it keeps
+        // its entry and only its progress is set. A rooted target loses its set,
+        // script animations included, in the reflow after it stops rendering;
+        // the branch above pushes the keyframes again on the next tick, and once
+        // its cancel events are sent it is unrooted. A set that still holds a
+        // finished transition stays rooted and is dirtied by the manager and
+        // rebuilt each tick while hidden.
         if changed && node.is_being_rendered_or_delegates_rendering(None) {
             node.dirty(no_gc, NodeDamage::Style);
         }
