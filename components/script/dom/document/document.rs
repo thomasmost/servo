@@ -376,6 +376,11 @@ bitflags! {
         /// event is only dispatched by "update animations and send events", so
         /// this asks for one.
         const AnimationPlaybackEventQueued = 1 << 3;
+        /// A script animation's effect, target, timing, timeline or play state
+        /// changed, so its sampled progress must be pushed into stylo at the
+        /// next rendering update. Paused, filled and cancelled animations are
+        /// not ticked, so nothing else would schedule that update.
+        const ScriptAnimationChanged = 1 << 4;
     }
 }
 
