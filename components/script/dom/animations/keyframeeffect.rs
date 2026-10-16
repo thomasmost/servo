@@ -16,9 +16,7 @@ use js::conversions::{
     ConversionResult, FromJSValConvertible, ToJSValConvertible, jsstr_to_string,
 };
 use js::gc::{HandleValue, RootedVec};
-use js::jsapi::{
-    HandleId, Heap, JS_GetProperty, JS_GetPropertyById, JSITER_OWNONLY, JSObject, JSPROP_ENUMERATE,
-};
+use js::jsapi::{HandleId, Heap, JS_GetProperty, JSITER_OWNONLY, JSObject, JSPROP_ENUMERATE};
 use js::jsval::{ObjectValue, UndefinedValue};
 use js::rust::wrappers2::{GetPropertyKeys, JS_DefineProperty, JS_IdToValue, JS_NewObject};
 use js::rust::{
@@ -98,7 +96,7 @@ impl KeyframeEffect {
     }
 
     /// The effect target, when it is an element.
-    #[allow(dead_code)] // Used from Phase 5 on; remove the attribute then.
+    #[expect(dead_code, reason = "used once effects are sampled")]
     pub(crate) fn target(&self) -> Option<DomRoot<Element>> {
         self.target_element.get()
     }
@@ -384,7 +382,9 @@ fn process_a_keyframes_argument(
     match result {
         Ok(()) => {},
         Err(ForOfIterationFailure::ValueIsNotIterable) => {
-            rooted!(&in(cx) let object = keyframes);
+            // `iterable` is rooted and follows any move by the GC while the
+            // iterator ran script, so the object is taken from it.
+            rooted!(&in(cx) let object = iterable.handle().to_object());
             unused_easings = process_a_property_indexed_keyframes_argument(
                 cx,
                 document,
@@ -536,11 +536,20 @@ fn process_a_property_indexed_keyframes_argument(
 
     // Step 5.1 Let property-indexed keyframe be the result of running the
     // procedure to process a keyframe-like object passing object as the
-    // keyframe input and with the allow lists flag set to true.
+    // keyframe input and with the allow lists flag set to true. Its first step
+    // converts the BasePropertyIndexedKeyframe members in dictionary order:
+    // composite, easing, then offset. Their values are applied below, but
+    // their conversion, and any exception it raises, comes before the
+    // animation properties are read.
+    let composites = read_member_list(cx, object, c"composite", convert_composite)?;
+    let mut easings = read_member_list(cx, object, c"easing", convert_domstring)?;
+    let offsets = read_member_list(cx, object, c"offset", convert_nullable_double)?;
+
+    // The animation properties are read after the members above.
     let properties = get_property_declarations(cx, object, &parser_context, true)?;
 
     // Step 5.2 For each member, m, in property-indexed keyframe (the
-    // "composite", "easing" and "offset" members are handled below):
+    // "composite", "easing" and "offset" members are applied below):
     struct PendingKeyframe {
         computed_offset: f64,
         declarations: Vec<KeyframePropertyDeclaration>,
@@ -592,14 +601,12 @@ fn process_a_property_indexed_keyframes_argument(
     // Steps 5.5 and 5.6 Assign each value in offsets to the keyframe offset of
     // the keyframe with the corresponding position in processed keyframes until
     // the end of either sequence is reached.
-    let offsets = read_member_list(cx, object, c"offset", convert_nullable_double)?;
     for (keyframe, offset) in processed_keyframes.iter_mut().zip(offsets) {
         keyframe.offset = offset;
     }
 
     // Steps 5.7 to 5.11 Easings: default to "linear", repeat to the length of
     // processed keyframes, keep the excess for step 9.
-    let mut easings = read_member_list(cx, object, c"easing", convert_domstring)?;
     if easings.is_empty() {
         easings.push(DOMString::from("linear"));
     }
@@ -615,7 +622,6 @@ fn process_a_property_indexed_keyframes_argument(
     // Step 5.12 If the composite member of property-indexed keyframe is not an
     // empty sequence, repeat it likewise and assign every value that is not
     // "auto".
-    let composites = read_member_list(cx, object, c"composite", convert_composite)?;
     if !composites.is_empty() {
         for (index, keyframe) in processed_keyframes.iter_mut().enumerate() {
             let composite = composites[index % composites.len()];
@@ -721,7 +727,7 @@ fn convert_composite(cx: &mut JSContext, value: HandleValue) -> Fallible<Composi
 /// <https://drafts.csswg.org/web-animations-1/#process-a-keyframe-like-object>.
 ///
 /// Returns, per animatable property found on the object in codepoint order of
-/// the property name, the parsed declaration of each value; `None` marks a
+/// its IDL attribute name, the parsed declaration of each value; `None` marks a
 /// value that did not parse (discarded per step 8.1 of "process a keyframes
 /// argument", but still counted as a keyframe in the property-indexed form).
 #[expect(unsafe_code)]
@@ -742,10 +748,12 @@ fn get_property_declarations(
     // easier.
     let mut ids = IdVector::new(cx);
     if !unsafe { GetPropertyKeys(cx, object, JSITER_OWNONLY, ids.handle_mut()) } {
-        return Ok(Vec::new());
+        return Err(Error::JSFailed);
     }
 
-    let mut properties = Vec::with_capacity(ids.len());
+    // Step 6 sorts the properties by IDL attribute name, so first collect the
+    // names of the animatable properties without reading any value.
+    let mut names = Vec::with_capacity(ids.len());
     for id in ids.iter() {
         rooted!(&in(cx) let id = *id);
 
@@ -757,11 +765,11 @@ fn get_property_declarations(
         rooted!(&in(cx) let mut key_value = UndefinedValue());
         let raw_id: HandleId = id.handle().into();
         if !unsafe { JS_IdToValue(cx, *raw_id.ptr, key_value.handle_mut()) } {
-            continue;
+            return Err(Error::JSFailed);
         }
         rooted!(&in(cx) let js_string = key_value.to_string());
         let Some(js_string) = NonNull::new(js_string.get()) else {
-            continue;
+            return Err(Error::JSFailed);
         };
         let property_name = unsafe { jsstr_to_string(cx, js_string) };
 
@@ -770,20 +778,35 @@ fn get_property_declarations(
         };
         debug_assert!(property_id.is_animatable());
 
+        // The lookup table only holds names built from ASCII CSS property
+        // names, so the name contains no NUL.
+        let Ok(name) = CString::new(property_name) else {
+            unreachable!("animatable IDL attribute names contain no NUL");
+        };
+        names.push((name, property_id));
+    }
+
+    // Step 6. Sort animation properties in ascending order by the Unicode
+    // codepoints that define each property name. The sort key is the IDL
+    // attribute name read from the object, as in the specification.
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut properties = Vec::with_capacity(names.len());
+    for (name, property_id) in names {
         // Step 7.1 Let raw value be the result of calling the [[Get]] internal
         // method on keyframe input, with property name as the property key and
         // keyframe input as the receiver.
         // Step 7.2 Check the completion record of raw value.
         rooted!(&in(cx) let mut property_value = UndefinedValue());
         if !unsafe {
-            JS_GetPropertyById(
+            JS_GetProperty(
                 cx.raw_cx(),
                 object.into_handle(),
-                id.handle().into_handle(),
+                name.as_ptr(),
                 property_value.handle_mut().into_handle_mut(),
             )
         } {
-            continue;
+            return Err(Error::JSFailed);
         }
 
         // Step 7.3 Convert raw value to a DOMString or to a sequence of
@@ -807,10 +830,6 @@ fn get_property_declarations(
         // name as the property name, and property values as the property value.
         properties.push((property_id, declarations));
     }
-
-    // Step 6. Sort animation properties in ascending order by the Unicode
-    // codepoints that define each property name.
-    properties.sort_by(|a, b| a.0.name().cmp(b.0.name()));
 
     Ok(properties)
 }
