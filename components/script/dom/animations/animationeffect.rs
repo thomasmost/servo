@@ -352,7 +352,13 @@ impl AnimationEffectMethods<crate::DomTypeHolder> for AnimationEffect {
     fn UpdateTiming(&self, cx: &mut JSContext, timing: &OptionalEffectTiming) -> Fallible<()> {
         // > Updates the specified timing properties of this animation effect by performing the procedure
         // > to update the timing properties of an animation effect passing the timing parameter as input.
-        self.update_the_timing_properties(cx, timing)
+        self.update_the_timing_properties(cx, timing)?;
+        // The new timing changes the sampled value, which a paused or filled
+        // animation would not otherwise refresh until something else ticks it.
+        if let Some(animation) = self.animation() {
+            animation.sampling_changed();
+        }
+        Ok(())
     }
 }
 

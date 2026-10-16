@@ -241,7 +241,11 @@ impl Animation {
         self.sampled_target.set(Some(&*target));
         self.sampled_generation.set(generation);
         self.sampled_progress.set(progress);
-        if changed {
+        // A target that is not rendered is not restyled for the sampled value:
+        // nothing shows it, and layout drops the stylo entry of an unrendered
+        // node after each reflow. The entry is still re-added every tick, so
+        // it is present for the first layout of a new target.
+        if changed && node.is_being_rendered_or_delegates_rendering(None) {
             node.dirty(no_gc, NodeDamage::Style);
         }
     }
@@ -394,17 +398,37 @@ impl Animation {
         }
     }
 
+    /// Called when something the sampled value depends on changed: the
+    /// effect, its target, keyframes, composite or timing, the timeline, the
+    /// current time or the play state. Puts the animation back on the
+    /// manager's list when it is relevant, and asks for a rendering update.
+    /// A paused, filled or cancelled animation is not ticked, so without the
+    /// update its stylo entry would wait for an unrelated frame.
+    pub(crate) fn sampling_changed(&self) {
+        let Some(document) = self.document_for_timing() else {
+            return;
+        };
+        if self.needs_ticks() || self.is_relevant() {
+            document.animation_manager().register_script_animation(self);
+        }
+        document.add_rendering_update_reason(RenderingUpdateReason::ScriptAnimationChanged);
+    }
+
     /// <https://drafts.csswg.org/web-animations-1/#setting-the-timeline>
     fn set_the_timeline(&self, cx: &mut JSContext, new_timeline: Option<&AnimationTimeline>) {
         let old_timeline = self.timeline.get();
         if old_timeline.as_deref() == new_timeline {
             return;
         }
+        // The old document's manager ticks this animation until a tick finds
+        // it has another timeline and removes it, which needs a tick.
+        self.sampling_changed();
         self.timeline.set(new_timeline);
         if self.start_time.get().is_some() {
             self.hold_time.set(None);
         }
         self.update_finished_state(cx, false, false);
+        self.sampling_changed();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#setting-the-associated-effect>
@@ -429,6 +453,7 @@ impl Animation {
             new_effect.set_animation(Some(self));
         }
         self.update_finished_state(cx, false, false);
+        self.sampling_changed();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#silently-set-the-current-time>
@@ -470,7 +495,7 @@ impl Animation {
             self.pending_task.set(None);
             self.resolve_ready_promise(cx);
         }
-        self.register_with_document();
+        self.sampling_changed();
         self.update_finished_state(cx, true, false);
         Ok(())
     }
@@ -494,7 +519,7 @@ impl Animation {
         if self.pending_task.take().is_some() {
             self.resolve_ready_promise(cx);
         }
-        self.register_with_document();
+        self.sampling_changed();
         self.update_finished_state(cx, true, false);
     }
 
@@ -559,7 +584,7 @@ impl Animation {
 
         // Step 12. The task runs on the next animation frame.
         self.pending_task.set(Some(PendingTask::Play));
-        self.register_with_document();
+        self.sampling_changed();
 
         // Step 13.
         self.update_finished_state(cx, false, false);
@@ -638,7 +663,7 @@ impl Animation {
         }
         // Step 10. The task runs on the next animation frame.
         self.pending_task.set(Some(PendingTask::Pause));
-        self.register_with_document();
+        self.sampling_changed();
         // Step 11.
         self.update_finished_state(cx, false, false);
         Ok(())
@@ -667,6 +692,7 @@ impl Animation {
             let _ = self.set_the_current_time(cx, Some(previous_time));
         }
         self.update_finished_state(cx, true, false);
+        self.sampling_changed();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#seamlessly-update-the-playback-rate>
@@ -755,7 +781,7 @@ impl Animation {
                 None => {},
             }
         }
-        self.register_with_document();
+        self.sampling_changed();
         self.update_finished_state(cx, true, true);
         Ok(())
     }
@@ -791,6 +817,7 @@ impl Animation {
         }
         self.hold_time.set(None);
         self.start_time.set(None);
+        self.sampling_changed();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#update-an-animations-finished-state>
@@ -871,9 +898,10 @@ impl Animation {
 
         // Anything that made the animation need ticks again (a longer
         // effect from updateTiming(), a new effect or timeline, a rate
-        // change on a finished animation) must put it back on the manager's
-        // list; registering is idempotent.
-        if self.needs_ticks() {
+        // change on a finished animation) or makes it relevant again (a fill
+        // added by updateTiming()) must put it back on the manager's list;
+        // registering is idempotent.
+        if self.needs_ticks() || self.is_relevant() {
             self.register_with_document();
         }
     }

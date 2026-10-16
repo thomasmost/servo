@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString};
 use std::ops::ControlFlow;
 use std::ptr::{self, NonNull};
 use std::sync::LazyLock;
+use std::sync::atomic::{self, AtomicU64};
 
 use cssparser::Parser;
 use dom_struct::dom_struct;
@@ -79,10 +80,15 @@ pub(crate) struct KeyframeEffect {
     /// <https://drafts.csswg.org/web-animations-1/#keyframe>
     keyframes: DomRefCell<Vec<Keyframe>>,
 
-    /// Bumped whenever the keyframes, composite or target change, so the
-    /// animation re-pushes the effect into stylo.
+    /// Changes whenever the keyframes, composite or target change, so the
+    /// animation re-pushes the effect into stylo. Values are drawn from one
+    /// counter for all effects, so an effect that replaces another on an
+    /// animation never shares its generation.
     generation: Cell<u64>,
 }
+
+/// The source of `KeyframeEffect::generation()` values.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl KeyframeEffect {
     pub(crate) fn new_inherited(window: &Window) -> Self {
@@ -91,7 +97,7 @@ impl KeyframeEffect {
             target_element: Default::default(),
             composite: Cell::new(CompositeOperation::Replace),
             keyframes: Default::default(),
-            generation: Cell::new(0),
+            generation: Cell::new(NEXT_GENERATION.fetch_add(1, atomic::Ordering::Relaxed)),
         }
     }
 
@@ -113,8 +119,15 @@ impl KeyframeEffect {
         self.generation.get()
     }
 
+    /// Gives the keyframes, composite or target a new generation, and tells
+    /// the animation that uses this effect, if any, that its sampled value
+    /// is out of date.
     fn bump_generation(&self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
+        self.generation
+            .set(NEXT_GENERATION.fetch_add(1, atomic::Ordering::Relaxed));
+        if let Some(animation) = self.upcast::<AnimationEffect>().animation() {
+            animation.sampling_changed();
+        }
     }
 
     /// This effect's keyframes in the form stylo samples: computed offsets,
