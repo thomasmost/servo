@@ -242,9 +242,10 @@ impl Animation {
         self.sampled_generation.set(generation);
         self.sampled_progress.set(progress);
         // A target that is not rendered is not restyled for the sampled value:
-        // nothing shows it, and layout drops the stylo entry of an unrendered
-        // node after each reflow. The entry is still re-added every tick, so
-        // it is present for the first layout of a new target.
+        // nothing shows it. Layout cancels a stylo set only for a rooted node
+        // (one with CSS animations or transitions) that stopped rendering, so
+        // a script-only target keeps its entry and only its progress is set.
+        // A cancelled entry is pushed again by the branch above on this tick.
         if changed && node.is_being_rendered_or_delegates_rendering(None) {
             node.dirty(no_gc, NodeDamage::Style);
         }
@@ -731,6 +732,9 @@ impl Animation {
                 self.play_an_animation(cx, false)?;
             },
         }
+        // A sign flip can move the phase or relevance of a paused, idle or
+        // finished animation, so its sampled value may change with no tick.
+        self.sampling_changed();
         Ok(())
     }
 
