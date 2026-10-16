@@ -44,6 +44,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::NoTrace;
 use crate::dom::document::Document;
+use crate::dom::element::Element;
 use crate::dom::event::Event;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
 use crate::dom::transitionevent::TransitionEvent;
@@ -437,6 +438,32 @@ impl AnimationManager {
             .borrow()
             .iter()
             .any(|animation| animation.needs_ticks())
+    }
+
+    /// The relevant script animations whose effect target `include`
+    /// accepts, in composite order. Script animations have no owning
+    /// element, so their composite order is their position in the global
+    /// animation list, which the sequence number records.
+    ///
+    /// <https://drafts.csswg.org/web-animations-1/#relevant>
+    pub(crate) fn relevant_script_animations(
+        &self,
+        include: &dyn Fn(&Element) -> bool,
+    ) -> Vec<DomRoot<WebAnimation>> {
+        let mut animations: Vec<DomRoot<WebAnimation>> = self
+            .script_animations
+            .borrow()
+            .iter()
+            .map(|animation| DomRoot::from_ref(&**animation))
+            .filter(|animation| {
+                animation.is_relevant() &&
+                    animation
+                        .effect_target()
+                        .is_some_and(|target| include(&target))
+            })
+            .collect();
+        animations.sort_by_key(|animation| animation.sequence_number());
+        animations
     }
 
     pub(crate) fn running_animation_count(&self) -> usize {

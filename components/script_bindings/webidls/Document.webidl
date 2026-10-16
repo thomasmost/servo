@@ -228,6 +228,9 @@ partial interface Document {
 // https://drafts.csswg.org/web-animations-1/#extensions-to-the-document-interface
 partial interface Document {
     readonly attribute DocumentTimeline timeline;
+    // https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations
+    [Pref="dom_web_animations_enabled"]
+    sequence<Animation> getAnimations();
 };
 
 // Servo internal API.
