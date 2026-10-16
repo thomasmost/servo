@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::AnimationBinding::{
@@ -22,19 +22,23 @@ use script_bindings::refcounted::Trusted;
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use script_bindings::root::DomRoot;
 use script_bindings::str::DOMString;
+use style::animation::{AnimationSetKey, ScriptAnimationId};
 use stylo_atoms::Atom;
 
 use crate::dom::animationeffect::AnimationEffect;
 use crate::dom::animationplaybackevent::AnimationPlaybackEvent;
+use crate::dom::animations::keyframeeffect::KeyframeEffect;
 use crate::dom::animations::timing;
 use crate::dom::bindings::codegen::Bindings::AnimationPlaybackEventBinding::AnimationPlaybackEventInit;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, MutNullableDom};
 use crate::dom::document::{Document, RenderingUpdateReason};
+use crate::dom::element::Element;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::node::{Node, NodeDamage};
 use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::types::{AnimationTimeline, DocumentTimeline};
 use crate::dom::window::Window;
@@ -116,6 +120,16 @@ pub(crate) struct Animation {
 
     /// Position in the global animation list.
     sequence_number: u64,
+
+    /// The element whose stylo animation set currently holds this
+    /// animation's effect, if any.
+    sampled_target: MutNullableDom<Element>,
+
+    /// The `KeyframeEffect::generation()` the stylo entry was built from.
+    sampled_generation: Cell<u64>,
+
+    /// The progress last written into the stylo entry.
+    sampled_progress: Cell<Option<f64>>,
 }
 
 impl Animation {
@@ -136,6 +150,9 @@ impl Animation {
             finish_notification_queued: Cell::new(false),
             replace_state: Cell::new(AnimationReplaceState::Active),
             sequence_number: NEXT_SEQUENCE_NUMBER.fetch_add(1, Ordering::Relaxed),
+            sampled_target: Default::default(),
+            sampled_generation: Cell::new(0),
+            sampled_progress: Cell::new(None),
         }
     }
 
@@ -166,6 +183,84 @@ impl Animation {
 
     pub(crate) fn playback_rate(&self) -> f64 {
         self.playback_rate.get()
+    }
+
+    /// This animation's id in stylo's animation sets.
+    fn script_animation_id(&self) -> ScriptAnimationId {
+        ScriptAnimationId(self.sequence_number)
+    }
+
+    /// Writes the effect's current iteration progress into stylo's
+    /// animation set for the target, starting the stylo animation when the
+    /// set does not hold it yet or the keyframes changed, and dirties the
+    /// target when the sampled value moved. Called by the manager after
+    /// every tick while the animation is tracked.
+    pub(crate) fn update_effect_sampling(&self, document: &Document, no_gc: &NoGC) {
+        let effect = self
+            .associated_effect
+            .get()
+            .and_then(|effect| DomRoot::downcast::<KeyframeEffect>(effect));
+        let target = effect.as_ref().and_then(|effect| effect.target());
+        let (Some(effect), Some(target)) = (effect, target) else {
+            self.stop_sampling(document, no_gc);
+            return;
+        };
+        // A detached target is never restyled; stylo would drop the entry
+        // and we would re-add it every tick. Resume when it is back.
+        if !target.upcast::<Node>().is_connected() {
+            self.stop_sampling(document, no_gc);
+            return;
+        }
+
+        // A new target or new keyframes: drop the old stylo entry first.
+        let generation = effect.generation();
+        if let Some(previous) = self.sampled_target.get() {
+            if !std::ptr::eq(&*previous, &*target) || self.sampled_generation.get() != generation {
+                self.stop_sampling(document, no_gc);
+            }
+        }
+
+        let timing = effect.upcast::<AnimationEffect>().timing();
+        let progress =
+            timing::compute(&timing, self.current_time(), self.playback_rate.get()).progress;
+        let node = target.upcast::<Node>();
+        let key = AnimationSetKey::new_for_non_pseudo(node.to_opaque());
+        let id = self.script_animation_id();
+        let sets = document.animation_manager().sets();
+        let mut changed = self.sampled_progress.get() != progress;
+        if !sets.set_script_animation_progress(&key, id, progress) {
+            // Not in the set yet (or stylo dropped it, e.g. the node left
+            // the document): push the keyframes; they resolve on restyle.
+            sets.start_script_animation(
+                &key,
+                effect.to_script_animation(id, document, timing.iteration_duration / 1000.0),
+            );
+            sets.set_script_animation_progress(&key, id, progress);
+            changed = true;
+        }
+        self.sampled_target.set(Some(&*target));
+        self.sampled_generation.set(generation);
+        self.sampled_progress.set(progress);
+        if changed {
+            node.dirty(no_gc, NodeDamage::Style);
+        }
+    }
+
+    /// Removes this animation from stylo's set for its last target and
+    /// restyles the target so its style reverts.
+    pub(crate) fn stop_sampling(&self, document: &Document, no_gc: &NoGC) {
+        let Some(target) = self.sampled_target.get() else {
+            return;
+        };
+        self.sampled_target.set(None);
+        self.sampled_progress.set(None);
+        let node = target.upcast::<Node>();
+        let key = AnimationSetKey::new_for_non_pseudo(node.to_opaque());
+        document
+            .animation_manager()
+            .sets()
+            .cancel_script_animation(&key, self.script_animation_id());
+        node.dirty(no_gc, NodeDamage::Style);
     }
 
     /// The document whose animation manager ticks this animation.
@@ -899,7 +994,9 @@ impl Animation {
         match self.play_state() {
             AnimationPlayState::Idle => false,
             AnimationPlayState::Finished => self.is_relevant(),
-            _ => self.needs_ticks(),
+            // A paused animation in effect is not ticked but its value still
+            // has to be sampled, so it stays tracked while it is relevant.
+            _ => self.needs_ticks() || self.is_relevant(),
         }
     }
 }

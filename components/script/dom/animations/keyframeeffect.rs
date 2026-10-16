@@ -36,6 +36,8 @@ use script_bindings::num::Finite;
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use script_bindings::root::DomRoot;
 use script_bindings::str::DOMString;
+use servo_arc::Arc as ServoArc;
+use style::animation::{ScriptAnimation, ScriptAnimationId, ScriptKeyframe};
 use style::parser::{Parse, ParserContext};
 use style::properties::generated::PropertyDeclaration;
 use style::properties::{
@@ -43,6 +45,7 @@ use style::properties::{
     SourcePropertyDeclaration,
 };
 use style::stylesheets::CssRuleType;
+use style::values::computed::AnimationComposition;
 use style::values::specified::TimingFunction;
 use style_traits::{CssWriter, ParsingMode, ToCss};
 
@@ -75,6 +78,10 @@ pub(crate) struct KeyframeEffect {
 
     /// <https://drafts.csswg.org/web-animations-1/#keyframe>
     keyframes: DomRefCell<Vec<Keyframe>>,
+
+    /// Bumped whenever the keyframes, composite or target change, so the
+    /// animation re-pushes the effect into stylo.
+    generation: Cell<u64>,
 }
 
 impl KeyframeEffect {
@@ -84,6 +91,7 @@ impl KeyframeEffect {
             target_element: Default::default(),
             composite: Cell::new(CompositeOperation::Replace),
             keyframes: Default::default(),
+            generation: Cell::new(0),
         }
     }
 
@@ -96,9 +104,78 @@ impl KeyframeEffect {
     }
 
     /// The effect target, when it is an element.
-    #[expect(dead_code, reason = "used once effects are sampled")]
     pub(crate) fn target(&self) -> Option<DomRoot<Element>> {
         self.target_element.get()
+    }
+
+    /// Changes when the keyframes, composite or target change.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    fn bump_generation(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+
+    /// This effect's keyframes in the form stylo samples: computed offsets,
+    /// computed easing, per-keyframe composite, and one declaration block
+    /// per keyframe locked by the document's author lock (the style
+    /// traversal reads them with its author guard).
+    pub(crate) fn to_script_animation(
+        &self,
+        id: ScriptAnimationId,
+        document: &Document,
+        iteration_duration_seconds: f64,
+    ) -> ScriptAnimation {
+        let keyframes = self.keyframes.borrow();
+        let offsets = compute_missing_keyframe_offsets(
+            &keyframes
+                .iter()
+                .map(|keyframe| keyframe.offset)
+                .collect::<Vec<_>>(),
+        );
+        let lock = &document.shared_style_locks().author;
+        let script_keyframes = keyframes
+            .iter()
+            .zip(offsets)
+            .map(|(keyframe, offset)| {
+                let mut block = PropertyDeclarationBlock::new();
+                for declaration in &keyframe.declarations {
+                    for (property, importance) in declaration.block.declaration_importance_iter() {
+                        block.push(property.clone(), importance);
+                    }
+                }
+                ScriptKeyframe {
+                    offset,
+                    easing: keyframe.easing.to_computed_value_without_context(),
+                    composite: composite_or_auto_to_stylo(keyframe.composite),
+                    declarations: ServoArc::new(lock.wrap(block)),
+                }
+            })
+            .collect();
+        ScriptAnimation::new(
+            id,
+            script_keyframes,
+            composite_to_stylo(self.composite.get()),
+            iteration_duration_seconds,
+        )
+    }
+}
+
+fn composite_to_stylo(composite: CompositeOperation) -> AnimationComposition {
+    match composite {
+        CompositeOperation::Replace => AnimationComposition::Replace,
+        CompositeOperation::Add => AnimationComposition::Add,
+        CompositeOperation::Accumulate => AnimationComposition::Accumulate,
+    }
+}
+
+fn composite_or_auto_to_stylo(composite: CompositeOperationOrAuto) -> Option<AnimationComposition> {
+    match composite {
+        CompositeOperationOrAuto::Auto => None,
+        CompositeOperationOrAuto::Replace => Some(AnimationComposition::Replace),
+        CompositeOperationOrAuto::Add => Some(AnimationComposition::Add),
+        CompositeOperationOrAuto::Accumulate => Some(AnimationComposition::Accumulate),
     }
 }
 
@@ -162,6 +239,7 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
 
     fn SetTarget(&self, target: Option<&Element>) {
         self.target_element.set(target);
+        self.bump_generation();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#dom-keyframeeffect-composite>
@@ -171,6 +249,7 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
 
     fn SetComposite(&self, composite: CompositeOperation) {
         self.composite.set(composite);
+        self.bump_generation();
     }
 
     /// <https://drafts.csswg.org/web-animations-1/#dom-keyframeeffect-getkeyframes>
@@ -295,6 +374,7 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
         let document = self.upcast::<AnimationEffect>().window().Document();
         let keyframes = process_a_keyframes_argument(cx, &document, keyframes)?;
         *self.keyframes.safe_borrow_mut(cx.no_gc()) = keyframes;
+        self.bump_generation();
         Ok(())
     }
 }

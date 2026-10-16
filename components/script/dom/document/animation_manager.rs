@@ -409,7 +409,10 @@ impl AnimationManager {
             .collect();
         let mut done = Vec::new();
         for animation in &animations {
-            if !animation.update_for_timeline_tick(cx, document) {
+            if animation.update_for_timeline_tick(cx, document) {
+                animation.update_effect_sampling(document, cx.no_gc());
+            } else {
+                animation.stop_sampling(document, cx.no_gc());
                 done.push(DomRoot::clone(animation));
             }
         }
