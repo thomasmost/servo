@@ -77,10 +77,6 @@ use crate::css::stylesheet_loader::StylesheetOwner;
 use crate::dom::RootedPromise;
 use crate::dom::activation::Activatable;
 use crate::dom::animation::Animation;
-use crate::dom::animationeffect::AnimationEffect;
-use crate::dom::animations::animationeffect::{
-    optional_effect_timing, optional_effect_timing_for_duration,
-};
 use crate::dom::animations::keyframeeffect::KeyframeEffect;
 use crate::dom::attr::{Attr, is_relevant_attribute};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
@@ -4615,15 +4611,11 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // null timeline stays null. (Step 5 reads the id from the same object,
         // and the timing input of the KeyframeEffect constructor comes from it
         // too.)
-        let (timeline, id, timing_input) = match &options {
-            UnrestrictedDoubleOrKeyframeAnimationOptions::KeyframeAnimationOptions(options) => (
-                options.timeline.clone(),
-                Some(options.id.clone()),
-                optional_effect_timing(&options.parent.parent),
-            ),
-            UnrestrictedDoubleOrKeyframeAnimationOptions::UnrestrictedDouble(duration) => {
-                (None, None, optional_effect_timing_for_duration(*duration))
+        let (timeline, id) = match &options {
+            UnrestrictedDoubleOrKeyframeAnimationOptions::KeyframeAnimationOptions(options) => {
+                (options.timeline.clone(), Some(options.id.clone()))
             },
+            UnrestrictedDoubleOrKeyframeAnimationOptions::UnrestrictedDouble(_) => (None, None),
         };
         let timeline = timeline.unwrap_or_else(|| {
             let document = self.owner_document();
@@ -4642,14 +4634,14 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
                 UnrestrictedDoubleOrKeyframeEffectOptions::KeyframeEffectOptions(options.parent)
             },
         };
-        let effect =
-            KeyframeEffect::Constructor(cx, &window, None, Some(target), keyframes, parent_options);
-        // The KeyframeEffect constructor does not apply its options yet (a
-        // later patch moves this into it): apply the timing input here so
-        // the animation has its duration, iterations and fill.
-        effect
-            .upcast::<AnimationEffect>()
-            .update_the_timing_properties(cx, &timing_input)?;
+        let effect = KeyframeEffect::Constructor(
+            cx,
+            &window,
+            None,
+            Some(target),
+            keyframes,
+            parent_options,
+        )?;
 
         // Step 4. Construct a new Animation object, animation, in the relevant
         // Realm of target by using the same procedure as the Animation() constructor,

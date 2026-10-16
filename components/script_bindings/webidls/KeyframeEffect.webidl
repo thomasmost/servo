@@ -5,15 +5,15 @@
 // https://drafts.csswg.org/web-animations-1/#keyframeeffect
 [Exposed=Window, Pref="dom_web_animations_enabled"]
 interface KeyframeEffect : AnimationEffect {
-  constructor(Element?       target,
-              object?        keyframes,
-              optional (unrestricted double or KeyframeEffectOptions) options = {});
-//   constructor(KeyframeEffect source);
-//   attribute Element?           target;
-//   attribute CSSOMString?       pseudoElement;
-//   attribute CompositeOperation composite;
-   [Throws] sequence<object> getKeyframes();
-   undefined        setKeyframes(object? keyframes);
+  [Throws] constructor(Element?       target,
+                       object?        keyframes,
+                       optional (unrestricted double or KeyframeEffectOptions) options = {});
+  // constructor(KeyframeEffect source);
+  attribute Element?           target;
+  // attribute CSSOMString?       pseudoElement;
+  attribute CompositeOperation composite;
+  [Throws] sequence<object> getKeyframes();
+  [Throws] undefined        setKeyframes(object? keyframes);
 };
 
 // https://drafts.csswg.org/web-animations-1/#dictdef-keyframeeffectoptions
