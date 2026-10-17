@@ -1280,10 +1280,39 @@ where
                 self.handle_request_from_background_hang_monitor(message);
             },
             #[cfg(feature = "multiprocess")]
-            Request::RemoveProcess(index) => self.process_manager.remove(index),
+            Request::RemoveProcess(index) => self.handle_process_exited(index),
             #[cfg(not(feature = "multiprocess"))]
             Request::RemoveProcess(_) => {},
         }
+    }
+
+    /// A content process's lifeline closed: reap it and, if it ran a script
+    /// event loop whose pipelines are still alive, treat them as crashed
+    /// right away, the same as a panic reported by the process itself. A
+    /// process that exits normally (its pipelines were closed first) and a
+    /// process that goes down during shutdown change nothing.
+    #[cfg(feature = "multiprocess")]
+    #[servo_tracing::instrument(skip_all)]
+    fn handle_process_exited(&mut self, index: usize) {
+        let Some(event_loop_id) = self.process_manager.remove(index) else {
+            return;
+        };
+        if self.shutting_down {
+            return;
+        }
+        let has_pipelines = self
+            .pipelines
+            .values()
+            .any(|pipeline| pipeline.event_loop.id() == event_loop_id);
+        if !has_pipelines {
+            return;
+        }
+        warn!("Content process for {event_loop_id:?} exited with live pipelines");
+        self.handle_panic(
+            Some(event_loop_id),
+            "The content process for this page exited unexpectedly.".to_string(),
+            None,
+        );
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -2569,7 +2598,7 @@ where
 
                     if let Ok(process) = content.spawn_multiprocess() {
                         let crossbeam_receiver = receiver.route_preserving_errors();
-                        self.process_manager.add(crossbeam_receiver, process);
+                        self.process_manager.add(crossbeam_receiver, process, None);
                     } else {
                         return warn!("Failed to spawn process for SW manager.");
                     }
